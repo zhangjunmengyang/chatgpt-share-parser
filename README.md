@@ -10,6 +10,7 @@ This tool avoids scraping ChatGPT's hydration payload. Instead, it renders the s
 - Detects `user` and `assistant` turns from the page markers
 - Converts KaTeX formulas into Markdown-friendly `$...$` and `$$...$$`
 - Preserves fenced code blocks
+- Preserves ChatGPT citation markers and appends source URLs when share metadata exposes them
 - Collapses excess blank lines for readable transcripts
 - Writes transcript Markdown, full rendered text, and JSON message arrays
 
@@ -67,10 +68,22 @@ JSON output is a list of objects shaped like:
   },
   {
     "role": "assistant",
-    "content": "..."
+    "content": "...",
+    "sources": [
+      {
+        "marker": "citeturn1search0",
+        "title": "Example Source",
+        "url": "https://example.com/source?utm_source=chatgpt.com",
+        "attribution": "Example"
+      }
+    ]
   }
 ]
 ```
+
+The `sources` field is present only when the shared conversation exposes source
+metadata. Markdown transcripts append those entries under a `### Sources`
+subsection for the corresponding assistant turn.
 
 ## CLI options
 

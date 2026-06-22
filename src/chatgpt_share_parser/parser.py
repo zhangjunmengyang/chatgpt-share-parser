@@ -6,8 +6,8 @@ import argparse
 import json
 import re
 from pathlib import Path
+from typing import Any
 
-PREAMBLE = "This is a copy of a conversation between ChatGPT & Anonymous."
 ROLE_LABELS = {
     "user": "User",
     "assistant": "Assistant",
@@ -116,6 +116,35 @@ EXTRACT_MESSAGES_JS = r"""
 }
 """
 
+WAIT_FOR_CONVERSATION_JS = r"""
+() => {
+  const loaderData =
+    window.__reactRouterContext?.state?.loaderData ||
+    window.__reactRouterDataRouter?.state?.loaderData ||
+    {};
+  const hasShareData = Object.values(loaderData).some((value) => {
+    const data = value?.serverResponse?.data;
+    return data?.linear_conversation || data?.mapping;
+  });
+  return hasShareData || document.querySelector('article');
+}
+"""
+
+
+EXTRACT_SHARE_DATA_JS = r"""
+() => {
+  const loaderData =
+    window.__reactRouterContext?.state?.loaderData ||
+    window.__reactRouterDataRouter?.state?.loaderData ||
+    {};
+  for (const value of Object.values(loaderData)) {
+    const data = value?.serverResponse?.data;
+    if (data?.linear_conversation || data?.mapping) return data;
+  }
+  return null;
+}
+"""
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -177,9 +206,12 @@ def render_page(
             page = browser.new_page(viewport={"width": 1440, "height": 2000})
             page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
             page.wait_for_timeout(settle_ms)
-            page.get_by_text(PREAMBLE).wait_for(timeout=30_000)
+            page.wait_for_function(WAIT_FOR_CONVERSATION_JS, timeout=30_000)
             rendered = page.locator("body").inner_text(timeout=30_000)
-            messages = page.evaluate(EXTRACT_MESSAGES_JS)
+            share_data = page.evaluate(EXTRACT_SHARE_DATA_JS)
+            messages = extract_messages_from_share_data(share_data)
+            if not messages:
+                messages = page.evaluate(EXTRACT_MESSAGES_JS)
             return rendered, messages
         except PlaywrightTimeoutError as exc:
             raise RuntimeError(
@@ -204,6 +236,147 @@ def write_json(path: Path | None, payload: object) -> None:
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+def extract_messages_from_share_data(data: dict[str, Any] | None) -> list[dict[str, Any]]:
+    """Extract visible transcript turns from ChatGPT share loader data."""
+
+    messages: list[dict[str, Any]] = []
+    preambles: list[str] = []
+    finished_markers: list[str] = []
+
+    for node in iter_conversation_nodes(data):
+        message = node.get("message") or {}
+        metadata = message.get("metadata") or {}
+        if metadata.get("is_visually_hidden_from_conversation"):
+            continue
+
+        author = message.get("author") or {}
+        role = author.get("role")
+        text = extract_message_text(message)
+
+        if role == "user" and message.get("recipient") == "all" and text:
+            messages.append({"role": "user", "content": text})
+            preambles = []
+            finished_markers = []
+            continue
+
+        if role == "tool" and metadata.get("finished_text"):
+            finished_markers.append(str(metadata["finished_text"]).strip())
+            continue
+
+        if role != "assistant" or message.get("recipient") != "all":
+            continue
+
+        content = message.get("content") or {}
+        if content.get("content_type") != "text" or not text:
+            continue
+
+        if metadata.get("is_thinking_preamble_message"):
+            preambles.append(text)
+            continue
+
+        assistant_parts = [*preambles, *finished_markers, text]
+        assistant_message: dict[str, Any] = {
+            "role": "assistant",
+            "content": "\n\n".join(part for part in assistant_parts if part),
+        }
+        sources = extract_message_sources(metadata)
+        if sources:
+            assistant_message["sources"] = sources
+        messages.append(assistant_message)
+        preambles = []
+        finished_markers = []
+
+    return messages
+
+
+def iter_conversation_nodes(data: dict[str, Any] | None) -> list[dict[str, Any]]:
+    if not isinstance(data, dict):
+        return []
+    linear_conversation = data.get("linear_conversation")
+    if isinstance(linear_conversation, list):
+        return [node for node in linear_conversation if isinstance(node, dict)]
+
+    mapping = data.get("mapping")
+    current_node = data.get("current_node")
+    if not isinstance(mapping, dict) or not current_node:
+        return []
+
+    nodes: list[dict[str, Any]] = []
+    node_id = current_node
+    seen: set[str] = set()
+    while isinstance(node_id, str) and node_id not in seen:
+        seen.add(node_id)
+        node = mapping.get(node_id)
+        if not isinstance(node, dict):
+            break
+        nodes.append(node)
+        node_id = node.get("parent")
+    return list(reversed(nodes))
+
+
+def extract_message_text(message: dict[str, Any]) -> str:
+    content = message.get("content") or {}
+    if "parts" in content:
+        return "\n".join(str(part) for part in content.get("parts") or []).strip()
+    if "text" in content:
+        return str(content.get("text") or "").strip()
+    return ""
+
+
+def extract_message_sources(metadata: dict[str, Any]) -> list[dict[str, str]]:
+    sources: list[dict[str, str]] = []
+    seen: set[tuple[str, str, str, str]] = set()
+
+    for reference in metadata.get("content_references") or []:
+        if not isinstance(reference, dict):
+            continue
+        marker = (reference.get("matched_text") or "").strip()
+        source_items = [
+            *(reference.get("items") or []),
+            *(reference.get("fallback_items") or []),
+            *(reference.get("sources") or []),
+        ]
+        for item in source_items:
+            if not isinstance(item, dict):
+                continue
+            add_source(sources, seen, item, marker)
+            for supporting in item.get("supporting_websites") or []:
+                add_source(sources, seen, supporting, marker)
+
+    return sources
+
+
+def add_source(
+    sources: list[dict[str, str]],
+    seen: set[tuple[str, str, str, str]],
+    item: Any,
+    marker: str,
+) -> None:
+    if not isinstance(item, dict):
+        return
+    title = str(item.get("title") or item.get("attribution") or item.get("url") or "")
+    url = str(item.get("url") or "")
+    attribution = str(item.get("attribution") or "")
+    if not title and not url:
+        return
+
+    key = (marker, title, url, attribution)
+    if key in seen:
+        return
+    seen.add(key)
+
+    source: dict[str, str] = {}
+    if marker:
+        source["marker"] = marker
+    if title:
+        source["title"] = title
+    if url:
+        source["url"] = url
+    if attribution:
+        source["attribution"] = attribution
+    sources.append(source)
+
+
 def normalize_message_content(text: str) -> str:
     text = text.strip()
     text = re.sub(r"\n{3,}", "\n\n", text)
@@ -222,9 +395,35 @@ def format_transcript(messages: list[dict[str, str]]) -> str:
         label = ROLE_LABELS.get(role, role.title())
         header = f"## {label} {counters[role]:02d}"
         content = normalize_message_content(message["content"])
+        sources = format_sources(message.get("sources", []))
+        if sources:
+            content = f"{content}\n\n{sources}"
         blocks.append(f"{header}\n\n{content}")
 
     return "\n\n".join(blocks).strip() + "\n"
+
+
+def format_sources(sources: object) -> str:
+    if not isinstance(sources, list) or not sources:
+        return ""
+
+    lines = ["### Sources", ""]
+    for source in sources:
+        if not isinstance(source, dict):
+            continue
+        marker = source.get("marker")
+        title = source.get("title") or source.get("url") or "Source"
+        url = source.get("url")
+        attribution = source.get("attribution")
+        marker_prefix = f"`{marker}`: " if marker else ""
+        if url:
+            line = f"- {marker_prefix}[{title}]({url})"
+        else:
+            line = f"- {marker_prefix}{title}"
+        if attribution:
+            line += f" — {attribution}"
+        lines.append(line)
+    return "\n".join(lines)
 
 
 def build_summary(
